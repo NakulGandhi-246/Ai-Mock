@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { cn } from "@/lib/utils";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { TooltipButton } from "./tooltip-button";
 import { Volume2, VolumeX } from "lucide-react";
 import { RecordAnswer } from "./record-answer";
@@ -17,18 +16,67 @@ export const QuestionSection = ({ questions }: QuestionSectionProps) => {
   const [activeIndex, setActiveIndex] = useState(0);
   const [showQuestion, setShowQuestion] = useState(false);
 
-  // 🔒 Track completed questions
-  const [completedIndex, setCompletedIndex] = useState(-1);
+  // Store all answers
+  const [allAnswers, setAllAnswers] = useState<
+    { question: string; answer: string; correct: string }[]
+  >([]);
 
-  // 🆕 Store all answers
-  const [allAnswers, setAllAnswers] = useState<{ question: string; answer: string }[]>([]);
+  // Cross-question states
+  const [isCrossQuestion, setIsCrossQuestion] = useState(false);
+  const [crossQuestionText, setCrossQuestionText] = useState("");
+  const [tempMainAnswer, setTempMainAnswer] = useState("");
 
-  // 🔊 Speak question
+  // ✅ SMART Cross Question Generator (added)
+  const generateCrossQuestion = (answer: string) => {
+    if (!answer) return "Can you explain that in more detail?";
+
+    const words = answer.toLowerCase().split(/\s+/);
+
+    const stopWords = [
+      "is",
+      "am",
+      "are",
+      "was",
+      "were",
+      "the",
+      "a",
+      "an",
+      "and",
+      "or",
+      "to",
+      "of",
+      "in",
+      "on",
+      "for",
+      "with",
+      "this",
+      "that",
+      "it",
+      "as",
+      "by",
+      "from",
+    ];
+
+    const keywords = words.filter(
+      (word) => word.length > 2 && !stopWords.includes(word)
+    );
+
+    const keyword = keywords[keywords.length - 1];
+
+    if (!keyword) {
+      return "Can you explain that in more detail?";
+    }
+
+    const formattedKeyword =
+      keyword.charAt(0).toUpperCase() + keyword.slice(1);
+
+    return `What is ${formattedKeyword}?`;
+  };
+
   const speakQuestion = (text: string) => {
     if (!("speechSynthesis" in window)) return;
 
     window.speechSynthesis.cancel();
-
     const speech = new SpeechSynthesisUtterance(text);
 
     speech.onstart = () => {
@@ -44,48 +92,61 @@ export const QuestionSection = ({ questions }: QuestionSectionProps) => {
     window.speechSynthesis.speak(speech);
   };
 
-  // Auto play when question changes
+  // Auto speak when question or cross-question changes
   useEffect(() => {
+    if (isCrossQuestion && crossQuestionText) {
+      speakQuestion(crossQuestionText);
+      return;
+    }
+
     if (!questions[activeIndex]) return;
+    speakQuestion(questions[activeIndex].question);
+  }, [activeIndex, isCrossQuestion, crossQuestionText, questions]);
 
-    const timer = setTimeout(() => {
-      speakQuestion(questions[activeIndex].question);
-    }, 0);
-
-    return () => clearTimeout(timer);
-  }, [activeIndex, questions]);
-
-  // Cleanup
   useEffect(() => {
     return () => {
       window.speechSynthesis.cancel();
     };
   }, []);
 
-  // 👉 Called after answer submit from RecordAnswer
+  // Next question handler
   const handleNextQuestion = (answer: string) => {
     window.speechSynthesis.cancel();
     setShowQuestion(false);
 
+    // If main question answered → ask cross question
+    if (!isCrossQuestion) {
+      const crossQ = generateCrossQuestion(answer);
+      setTempMainAnswer(answer);
+      setCrossQuestionText(crossQ);
+      setIsCrossQuestion(true);
+      return;
+    }
+
+    // If cross question answered → save both answers
     const currentAnswer = {
       question: questions[activeIndex].question,
-      answer,
+      answer: `${tempMainAnswer} | Follow-up: ${answer}`,
+      correct: questions[activeIndex].answer,
     };
 
-    // Save answer
-    setAllAnswers((prev) => [...prev, currentAnswer]);
+    const updatedAnswers = [...allAnswers, currentAnswer];
+    setAllAnswers(updatedAnswers);
 
-    // ✅ Mark current question as completed
-    setCompletedIndex(activeIndex);
+    // Reset cross state
+    setIsCrossQuestion(false);
+    setCrossQuestionText("");
+    setTempMainAnswer("");
 
+    // Move to next main question or feedback
     if (activeIndex < questions.length - 1) {
-      // ✅ Automatically move to next question tab
       setActiveIndex((prev) => prev + 1);
-      setShowQuestion(false);
     } else {
-      // ✅ Last question completed → Go to Feedback with all answers
       navigate("/generate/feedback/demo", {
-        state: { answers: [...allAnswers, currentAnswer] },
+        state: {
+          answers: updatedAnswers,
+          questions: questions,
+        },
       });
     }
   };
@@ -97,38 +158,14 @@ export const QuestionSection = ({ questions }: QuestionSectionProps) => {
         className="w-full space-y-12"
         orientation="vertical"
       >
-        {/* Question Numbers */}
-        <TabsList className="bg-transparent w-full flex flex-wrap gap-4">
-          {questions.map((_, i) => {
-            // ✅ Show only tabs up to completedIndex + 1
-            if (i > completedIndex + 1) return null;
-
-            return (
-              <TabsTrigger
-                key={i}
-                value={questions[i].question}
-                className={cn(
-                  "text-xs px-2",
-                  i === activeIndex && "bg-emerald-200 shadow-md"
-                )}
-                onClick={() => {
-                  window.speechSynthesis.cancel();
-                  setActiveIndex(i);
-                  setShowQuestion(false);
-                }}
-              >
-                {`Question #${i + 1}`}
-              </TabsTrigger>
-            );
-          })}
-        </TabsList>
-
-        {/* Question Content */}
-        {questions.map((tab, i) => (
-          <TabsContent key={i} value={tab.question}>
-            {showQuestion && i === activeIndex && (
+        {questions[activeIndex] && (
+          <TabsContent value={questions[activeIndex].question}>
+            {/* Question Text */}
+            {showQuestion && (
               <p className="text-base text-left tracking-wide text-neutral-500">
-                {tab.question}
+                {isCrossQuestion
+                  ? crossQuestionText
+                  : questions[activeIndex].question}
               </p>
             )}
 
@@ -149,39 +186,32 @@ export const QuestionSection = ({ questions }: QuestionSectionProps) => {
                     setIsPlaying(false);
                     setShowQuestion(true);
                   } else {
-                    speakQuestion(tab.question);
+                    speakQuestion(
+                      isCrossQuestion
+                        ? crossQuestionText
+                        : questions[activeIndex].question
+                    );
                   }
                 }}
               />
             </div>
 
             {/* Answer Section */}
-            {i === activeIndex && showQuestion && (
-              <>
-                <RecordAnswer
-                  question={tab}
-                  onSubmit={(answer: string) => handleNextQuestion(answer)}
-                />
-
-                {/* Show button only on last question */}
-                {activeIndex === questions.length - 1 && (
-                  <div className="mt-4 flex justify-end">
-                    <button
-                      onClick={() =>
-                        navigate("/generate/feedback/demo", {
-                          state: { answers: allAnswers },
-                        })
-                      }
-                      className="px-4 py-2 bg-emerald-600 text-white rounded-md"
-                    >
-                      View Feedback
-                    </button>
-                  </div>
-                )}
-              </>
+            {showQuestion && (
+              <RecordAnswer
+                question={
+                  isCrossQuestion
+                    ? { question: crossQuestionText, answer: "" }
+                    : questions[activeIndex]
+                }
+                questions={questions}
+                currentIndex={activeIndex}
+                totalQuestions={questions.length}
+                onSubmit={handleNextQuestion}
+              />
             )}
           </TabsContent>
-        ))}
+        )}
       </Tabs>
     </div>
   );

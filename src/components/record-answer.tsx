@@ -19,10 +19,13 @@ import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import { db } from "@/config/firebase.config";
 import ProctoringCamera from "@/components/proctoringCamera";
 
-// record-answer.tsx
+// ===== Props =====
 interface RecordAnswerProps {
   question: { question: string; answer: string };
-  onSubmit: (answer: string) => void; // ✅ Correct type
+  questions: { question: string; answer: string }[];
+  currentIndex: number;
+  totalQuestions: number;
+  onSubmit: (answer: string) => void;
 }
 
 interface AIResponse {
@@ -32,6 +35,9 @@ interface AIResponse {
 
 export const RecordAnswer = ({
   question,
+  questions,
+  currentIndex,
+  totalQuestions,
   onSubmit,
 }: RecordAnswerProps) => {
   const {
@@ -46,6 +52,7 @@ export const RecordAnswer = ({
   });
 
   const [userAnswer, setUserAnswer] = useState("");
+  const [allAnswers, setAllAnswers] = useState<string[]>([]);
   const [isAiGenerating, setIsAiGenerating] = useState(false);
   const [aiResult, setAiResult] = useState<AIResponse | null>(null);
   const [open, setOpen] = useState(false);
@@ -58,10 +65,60 @@ export const RecordAnswer = ({
   const { userId } = useAuth();
   const { interviewId } = useParams();
 
+  const isLastQuestion = currentIndex === totalQuestions - 1;
+
+  // ===== Overall AI Feedback =====
+  const generateOverallResult = async (
+    allQuestions: { question: string; answer: string }[],
+    answers: string[]
+  ): Promise<AIResponse> => {
+    setIsAiGenerating(true);
+
+    const combinedText = allQuestions
+      .map(
+        (q, i) => `
+Q${i + 1}: ${q.question}
+User Answer: ${answers[i] || ""}
+Correct Answer: ${q.answer}
+`
+      )
+      .join("\n");
+
+    const prompt = `
+You are an interview evaluator.
+
+Evaluate the candidate based on all answers.
+
+${combinedText}
+
+Return JSON:
+{
+  "ratings": number,
+  "feedback": string
+}
+`;
+
+    try {
+      const aiRes = await chatSession.sendMessage(prompt);
+      const text = aiRes.response.text().replace(/(json|```|`)/g, "").trim();
+      return JSON.parse(text);
+    } catch {
+      toast.error("Error generating overall feedback");
+      return { ratings: 0, feedback: "Unable to generate feedback" };
+    } finally {
+      setIsAiGenerating(false);
+    }
+  };
+
   // ===== Start / Stop Recording =====
   const recordUserAnswer = async () => {
     if (isRecording) {
       stopSpeechToText();
+
+      // Clean undefined after stop
+      setUserAnswer((prev) =>
+        prev.replace(/undefined/g, "").trim()
+      );
 
       if (timerRef.current) {
         clearInterval(timerRef.current);
@@ -78,18 +135,18 @@ export const RecordAnswer = ({
         return;
       }
 
-      const result = await generateResult(
-        question.question,
-        question.answer,
-        userAnswer
-      );
+      const updatedAnswers = [...allAnswers, userAnswer];
+      setAllAnswers(updatedAnswers);
 
-      setAiResult(result);
+      if (isLastQuestion) {
+        const result = await generateOverallResult(questions, updatedAnswers);
+        setAiResult(result);
+      } else {
+        toast.success("Answer recorded");
+      }
     } else {
       setUserAnswer("");
-      setAiResult(null);
       setRecordingTime(0);
-
       startSpeechToText();
 
       timerRef.current = setInterval(() => {
@@ -98,37 +155,9 @@ export const RecordAnswer = ({
     }
   };
 
-  // ===== AI Feedback =====
-  const generateResult = async (
-    qst: string,
-    qstAns: string,
-    userAns: string
-  ): Promise<AIResponse> => {
-    setIsAiGenerating(true);
-
-    const prompt = `
-Question: "${qst}"
-User Answer: "${userAns}"
-Correct Answer: "${qstAns}"
-Give rating (1-10) and feedback.
-Return JSON with fields "ratings" and "feedback".
-`;
-
-    try {
-      const aiRes = await chatSession.sendMessage(prompt);
-      const text = aiRes.response.text().replace(/(json|```|`)/g, "").trim();
-      return JSON.parse(text);
-    } catch {
-      toast.error("Error generating feedback");
-      return { ratings: 0, feedback: "Unable to generate feedback" };
-    } finally {
-      setIsAiGenerating(false);
-    }
-  };
-
   // ===== Save Answer =====
   const saveUserAnswer = async () => {
-    if (!aiResult || recordingTime < MIN_RECORD_TIME) {
+    if (recordingTime < MIN_RECORD_TIME) {
       toast.error("Complete minimum recording first");
       return;
     }
@@ -141,8 +170,8 @@ Return JSON with fields "ratings" and "feedback".
         question: question.question,
         correct_ans: question.answer,
         user_ans: userAnswer,
-        feedback: aiResult.feedback,
-        rating: aiResult.ratings,
+        overall_feedback: aiResult?.feedback || "",
+        overall_rating: aiResult?.ratings || 0,
         userId,
         attemptAt: serverTimestamp(),
         createdAt: serverTimestamp(),
@@ -151,14 +180,7 @@ Return JSON with fields "ratings" and "feedback".
       toast.success("Answer saved");
 
       setUserAnswer("");
-      setAiResult(null);
       setRecordingTime(0);
-
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-
       stopSpeechToText();
       setOpen(false);
 
@@ -172,14 +194,20 @@ Return JSON with fields "ratings" and "feedback".
     }
   };
 
-  // ===== Combine Speech (Final + Live) =====
+  // ===== Combine Speech (FINAL FIX) =====
   useEffect(() => {
     const transcript = results
       .filter((r): r is ResultType => typeof r !== "string")
       .map((r) => r.transcript)
       .join(" ");
 
-    setUserAnswer((transcript + " " + interimResult).trim());
+    const finalText = [transcript, interimResult]
+      .filter((text) => text && text !== "undefined")
+      .join(" ")
+      .replace(/undefined/g, "")
+      .trim();
+
+    setUserAnswer(finalText);
   }, [results, interimResult]);
 
   useEffect(() => {
@@ -220,10 +248,14 @@ Return JSON with fields "ratings" and "feedback".
             )
           }
           onClick={() => setOpen(true)}
-          disabled={!aiResult || recordingTime < MIN_RECORD_TIME}
+          disabled={
+            recordingTime < MIN_RECORD_TIME ||
+            (isLastQuestion && !aiResult)
+          }
         />
       </div>
 
+      {/* User Answer */}
       <div className="w-full mt-4 p-4 border rounded-md bg-gray-50">
         <h2 className="text-lg font-semibold">Your Answer:</h2>
         <p className="text-sm mt-2 text-gray-700">
@@ -231,7 +263,22 @@ Return JSON with fields "ratings" and "feedback".
         </p>
       </div>
 
-      {/* ✅ Always ON Proctoring Camera */}
+      {/* Overall Feedback */}
+      {isLastQuestion && aiResult && (
+        <div className="w-full p-4 border rounded-md bg-green-50">
+          <h2 className="text-lg font-semibold">
+            Overall Interview Result
+          </h2>
+          <p className="mt-2 font-medium">
+            Rating: {aiResult.ratings}/10
+          </p>
+          <p className="text-sm mt-2 text-gray-700">
+            {aiResult.feedback}
+          </p>
+        </div>
+      )}
+
+      {/* Proctoring Camera */}
       <div className="w-full h-[300px] md:w-96 flex items-center justify-center border p-2 bg-gray-50 rounded-md">
         <ProctoringCamera />
       </div>

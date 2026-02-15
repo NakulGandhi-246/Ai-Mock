@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import {
@@ -25,7 +26,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@clerk/clerk-react";
 import { toast } from "sonner";
-import { Loader, Trash2 } from "lucide-react";
+import { Loader } from "lucide-react";
 
 import { chatSession } from "@/scripts";
 import {
@@ -38,14 +39,22 @@ import {
 } from "firebase/firestore";
 import { db } from "@/config/firebase.config";
 
+/* PDF */
+import * as pdfjsLib from "pdfjs-dist";
+import pdfWorker from "pdfjs-dist/build/pdf.worker?url";
+import type { TextItem } from "pdfjs-dist/types/src/display/api";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+
 /* --------------------------------------------------
    Schema
 -------------------------------------------------- */
 const formSchema = z.object({
-  position: z.string().min(1, "Position is required").max(100),
-  description: z.string().min(10, "Description is required"),
-  experience: z.number().min(0, "Experience must be 0 or more"),
-  techStack: z.string().min(1, "Tech stack is required"),
+  position: z.string().min(1),
+  description: z.string().min(10),
+  experience: z.number().min(0),
+  techStack: z.string().min(1),
+  resume: z.instanceof(FileList).optional(),
 });
 
 type FormData = z.infer<typeof formSchema>;
@@ -57,16 +66,11 @@ interface FormMockInterviewProps {
 /* --------------------------------------------------
    Component
 -------------------------------------------------- */
-export const FormMockInterview = ({
-  initialData,
-}: FormMockInterviewProps) => {
+export const FormMockInterview = ({ initialData }: FormMockInterviewProps) => {
   const navigate = useNavigate();
   const { userId } = useAuth();
   const [loading, setLoading] = useState(false);
 
-  /* --------------------------------------------------
-     Form Setup (FIXED defaultValues)
-  -------------------------------------------------- */
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
     defaultValues: {
@@ -74,15 +78,13 @@ export const FormMockInterview = ({
       description: initialData?.description ?? "",
       experience: initialData?.experience ?? 0,
       techStack: initialData?.techStack ?? "",
+      resume: undefined,
     },
     mode: "onChange",
   });
 
-  const { isValid, isSubmitting } = form.formState;
+  const { isValid } = form.formState;
 
-  /* --------------------------------------------------
-     Reset when editing
-  -------------------------------------------------- */
   useEffect(() => {
     if (initialData) {
       form.reset({
@@ -90,81 +92,159 @@ export const FormMockInterview = ({
         description: initialData.description,
         experience: initialData.experience,
         techStack: initialData.techStack,
+        resume: undefined,
       });
     }
   }, [initialData, form]);
 
   /* --------------------------------------------------
-     Clean AI JSON
+     Helpers
   -------------------------------------------------- */
+
   const cleanAiResponse = (text: string) => {
     const start = text.indexOf("[");
     const end = text.lastIndexOf("]");
-    if (start === -1 || end === -1) {
-      throw new Error("Invalid AI response");
-    }
     return JSON.parse(text.slice(start, end + 1));
   };
 
-  /* --------------------------------------------------
-     Generate AI Questions
-  -------------------------------------------------- */
-  const generateQuestions = async (data: FormData) => {
-    const prompt = `
-Generate 5 technical interview questions and answers.
+  /* 🔥 Cloudinary Upload */
+  const uploadResumeToCloudinary = async (file: File): Promise<string> => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("upload_preset", "resume_upload"); // create this preset in Cloudinary
 
-Return ONLY valid JSON array.
-Format:
+    const res = await fetch(
+      "https://api.cloudinary.com/v1_1/dmgignx2j/auto/upload",
+      {
+        method: "POST",
+        body: formData,
+      }
+    );
+
+    if (!res.ok) throw new Error("Cloudinary upload failed");
+
+    const data = await res.json();
+    return data.secure_url;
+  };
+
+  const extractTextFromPDF = async (file: File): Promise<string> => {
+    const buffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+
+    let text = "";
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+
+      text += content.items
+        .map((item) =>
+          "str" in item ? (item as TextItem).str : ""
+        )
+        .join(" ");
+    }
+
+    return text.slice(0, 4000);
+  };
+
+const generateQuestions = async (
+  data: FormData,
+  resumeText?: string
+) => {
+  const prompt = `
+Return ONLY JSON array:
 [
  { "question": "...", "answer": "..." }
 ]
 
 Position: ${data.position}
 Description: ${data.description}
-Experience: ${data.experience} years
+Experience: ${data.experience}
 Tech Stack: ${data.techStack}
+
+Resume:
+${resumeText || "Not provided"}
 `;
 
-    const result = await chatSession.sendMessage(prompt);
-    return cleanAiResponse(result.response.text());
-  };
+  let attempts = 0;
+  const maxAttempts = 3;
+
+  while (attempts < maxAttempts) {
+    try {
+      const result = await chatSession.sendMessage(prompt);
+      return cleanAiResponse(result.response.text());
+    } catch (error: unknown) {
+      if (
+        error instanceof Error &&
+        error.message.includes("503") &&
+        attempts < maxAttempts - 1
+      ) {
+        attempts++;
+        console.log("Gemini busy, retrying...", attempts);
+        await new Promise((res) => setTimeout(res, 2000));
+      } else {
+        throw error;
+      }
+    }
+  }
+};
+
+
 
   /* --------------------------------------------------
      Submit
   -------------------------------------------------- */
   const onSubmit: SubmitHandler<FormData> = async (data) => {
     if (!userId) {
-      toast.error("Please login first");
-      navigate("/sign-in");
+      toast.error("Login required");
       return;
     }
 
     try {
       setLoading(true);
-      toast("Generating AI questions...");
 
-      const questions = await generateQuestions(data);
+      let resumeUrl = initialData?.resumeUrl || "";
+      let resumeText = "";
+
+      const file = data.resume?.[0];
+
+      if (file) {
+        toast("Uploading resume...");
+        resumeUrl = await uploadResumeToCloudinary(file);
+
+        if (file.type === "application/pdf") {
+          toast("Analyzing resume...");
+          resumeText = await extractTextFromPDF(file);
+        }
+      }
+
+      toast("Generating questions...");
+      const questions = await generateQuestions(data, resumeText);
+
+      /* 🔥 Remove FileList before saving */
+      const { resume, ...restData } = data;
 
       if (initialData) {
         await updateDoc(doc(db, "interviews", initialData.id), {
-          ...data,
+          ...restData,
+          resumeUrl,
           questions,
           updatedAt: serverTimestamp(),
         });
-        toast.success("Interview updated");
       } else {
         await addDoc(collection(db, "interviews"), {
-          ...data,
-          userId,
+          ...restData,
+          resumeUrl,
           questions,
+          userId,
           createdAt: serverTimestamp(),
         });
-        toast.success("Interview created");
       }
 
+      toast.success("Interview saved");
       navigate("/generate");
-    } catch (error) {
-      console.error(error);
+    } catch (err) {
+      console.error(err);
       toast.error("Something went wrong");
     } finally {
       setLoading(false);
@@ -172,119 +252,62 @@ Tech Stack: ${data.techStack}
   };
 
   /* --------------------------------------------------
-     Delete Interview
+     Delete
   -------------------------------------------------- */
   const handleDelete = async () => {
     if (!initialData) return;
+    if (!confirm("Delete interview?")) return;
 
-    if (!confirm("Delete this interview?")) return;
-
-    try {
-      setLoading(true);
-      await deleteDoc(doc(db, "interviews", initialData.id));
-      toast.success("Interview deleted");
-      navigate("/generate");
-    } catch (error) {
-      console.error(error);
-      toast.error("Delete failed");
-    } finally {
-      setLoading(false);
-    }
+    await deleteDoc(doc(db, "interviews", initialData.id));
+    navigate("/generate");
   };
 
   /* --------------------------------------------------
      UI
   -------------------------------------------------- */
-  const title = initialData
-    ? initialData.position
-    : "Create a new mock interview";
-
-  const actionText = initialData ? "Save Changes" : "Create";
-
   return (
-    <div className="w-full flex-col space-y-4">
+    <div className="space-y-4">
       <CustomBreadCrumb
-        breadCrumbPage={initialData ? initialData.position : "Create"}
-        breadCrumbItems={[
-          { label: "Mock Interviews", link: "/generate" },
-        ]}
+        breadCrumbPage={initialData ? "Edit" : "Create"}
+        breadCrumbItems={[{ label: "Mock Interviews", link: "/generate" }]}
       />
 
-      <div className="flex items-center justify-between">
-        <Headings title={title} isSubHeading />
-
-        {initialData && (
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={handleDelete}
-            disabled={loading}
-          >
-            <Trash2 className="text-red-500" />
-          </Button>
-        )}
-      </div>
-
+      <Headings title="Mock Interview" isSubHeading />
       <Separator />
 
       <FormProvider {...form}>
         <form
           onSubmit={form.handleSubmit(onSubmit)}
-          className="p-8 shadow-md rounded-lg flex flex-col gap-6"
+          className="p-6 space-y-6 shadow rounded"
         >
-          {/* Position */}
           <FormField
             control={form.control}
             name="position"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Job Position</FormLabel>
+                <FormLabel>Position</FormLabel>
                 <FormControl>
-                  <Input disabled={loading} {...field} />
+                  <Input {...field} />
                 </FormControl>
                 <FormMessage />
               </FormItem>
             )}
           />
 
-          {/* Description */}
           <FormField
             control={form.control}
             name="description"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Job Description</FormLabel>
+                <FormLabel>Description</FormLabel>
                 <FormControl>
-                  <Textarea disabled={loading} {...field} />
+                  <Textarea {...field} />
                 </FormControl>
                 <FormMessage />
               </FormItem>
             )}
           />
 
-          {/* Experience */}
-          <FormField
-            control={form.control}
-            name="experience"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Experience (Years)</FormLabel>
-                <FormControl>
-                  <Input
-                    type="number"
-                    disabled={loading}
-                    value={field.value}
-                    onChange={(e) =>
-                      field.onChange(Number(e.target.value))
-                    }
-                  />
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-
-          {/* Tech Stack */}
           <FormField
             control={form.control}
             name="techStack"
@@ -292,33 +315,33 @@ Tech Stack: ${data.techStack}
               <FormItem>
                 <FormLabel>Tech Stack</FormLabel>
                 <FormControl>
-                  <Textarea disabled={loading} {...field} />
+                  <Textarea {...field} />
                 </FormControl>
                 <FormMessage />
               </FormItem>
             )}
           />
 
-          <div className="flex justify-end gap-4">
-            <Button
-              type="reset"
-              variant="outline"
-              disabled={loading || isSubmitting}
-            >
-              Reset
-            </Button>
+          <FormField
+            control={form.control}
+            name="resume"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Upload Resume (PDF)</FormLabel>
+                <Input
+                  type="file"
+                  accept=".pdf"
+                  onChange={(e) =>
+                    field.onChange(e.target.files ?? undefined)
+                  }
+                />
+              </FormItem>
+            )}
+          />
 
-            <Button
-              type="submit"
-              disabled={!isValid || loading || isSubmitting}
-            >
-              {loading ? (
-                <Loader className="animate-spin" />
-              ) : (
-                actionText
-              )}
-            </Button>
-          </div>
+          <Button disabled={!isValid || loading}>
+            {loading ? <Loader className="animate-spin" /> : "Submit"}
+          </Button>
         </form>
       </FormProvider>
     </div>
